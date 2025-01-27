@@ -5,16 +5,20 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"regexp"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
+	"github.com/dgrijalva/jwt-go"
 	"golang.org/x/crypto/bcrypt"
 	_ "github.com/go-sql-driver/mysql"
 )
 
-var db *sql.DB
+var (
+	db        *sql.DB
+	jwtSecret []byte
+)
 
 // Load environment variables
 func loadEnvVars() {
@@ -22,209 +26,271 @@ func loadEnvVars() {
 	if err != nil {
 		log.Fatal("Error loading .env file")
 	}
+	jwtSecret = []byte(os.Getenv("JWT_SECRET"))
+	if len(jwtSecret) == 0 {
+		log.Fatal("JWT_SECRET is not set in .env file")
+	}
 }
 
-// Initialize the MySQL connection
+// Middleware to enable CORS
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+		c.Next()
+	}
+}
+
+// Middleware to verify JWT
+func authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		tokenString := c.GetHeader("Authorization")
+		if tokenString == "" {
+			c.JSON(401, gin.H{"error": "Authorization token required"})
+			c.Abort()
+			return
+		}
+
+		token, err := jwt.Parse(tokenString[7:], func(token *jwt.Token) (interface{}, error) {
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method")
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			c.JSON(401, gin.H{"error": "Invalid token"})
+			c.Abort()
+			return
+		}
+
+		claims := token.Claims.(jwt.MapClaims)
+		c.Set("userId", claims["userId"].(string))
+		c.Next()
+	}
+}
+
+// Initialize the database
 func initDB() {
 	var err error
-	// Get database credentials from environment variables
 	dbHost := os.Getenv("DB_HOST")
 	dbUser := os.Getenv("DB_USER")
 	dbPassword := os.Getenv("DB_PASSWORD")
 	dbName := os.Getenv("DB_NAME")
 
-	// Format the connection string for creating the database
 	connStr := fmt.Sprintf("%s:%s@tcp(%s)/", dbUser, dbPassword, dbHost)
 	db, err = sql.Open("mysql", connStr)
 	if err != nil {
-		log.Fatal("Error connecting to the MySQL server:", err)
+		log.Fatal("Error connecting to MySQL:", err)
 	}
 
-	// Check if the database exists, if not, create it
 	_, err = db.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", dbName))
 	if err != nil {
 		log.Fatal("Error creating database:", err)
 	}
 
-	// Now connect to the specific database
 	connStr = fmt.Sprintf("%s:%s@tcp(%s)/%s", dbUser, dbPassword, dbHost, dbName)
 	db, err = sql.Open("mysql", connStr)
 	if err != nil {
-		log.Fatal("Error connecting to the database:", err)
+		log.Fatal("Error connecting to database:", err)
 	}
 
-	// Check if the database connection is established
 	if err := db.Ping(); err != nil {
-		log.Fatal("Error pinging the database:", err)
+		log.Fatal("Error pinging database:", err)
 	}
 
-	// Check if the tables exist, if not, create them
-	createTable()
+	createTables()
 }
 
-// Create the saree_details and users tables
-func createTable() {
-	// Create the saree_details table
-	sareeTableCreationQuery := `
-		CREATE TABLE IF NOT EXISTS saree_details (
-			id VARCHAR(36) PRIMARY KEY,
-			material VARCHAR(255) NOT NULL,
-			price DECIMAL(10, 2) NOT NULL,
-			in_date DATE NOT NULL,
-			weaver VARCHAR(255),
-			dyeType VARCHAR(50) NOT NULL,
-			ikatType VARCHAR(50) NOT NULL
-		);
-	`
-
-	// Create the users table
-	usersTableCreationQuery := `
-		CREATE TABLE IF NOT EXISTS users (
-			id VARCHAR(36) PRIMARY KEY,
-			name VARCHAR(255) NOT NULL,
-			phone VARCHAR(15) NOT NULL,
-			email VARCHAR(255) NOT NULL UNIQUE,
-			password VARCHAR(255) NOT NULL
-		);
-	`
-
-	// Execute the queries separately
-	_, err := db.Exec(sareeTableCreationQuery)
-	if err != nil {
-		log.Fatal("Error creating saree_details table:", err)
-	}
-
-	_, err = db.Exec(usersTableCreationQuery)
+// Create necessary tables
+func createTables() {
+	usersTable := `
+	CREATE TABLE IF NOT EXISTS users (
+		id VARCHAR(36) PRIMARY KEY,
+		name VARCHAR(255),
+		email VARCHAR(255) UNIQUE,
+		password VARCHAR(255),
+		role VARCHAR(50) DEFAULT 'user',
+		isApproved BOOLEAN DEFAULT FALSE
+	);`
+	_, err := db.Exec(usersTable)
 	if err != nil {
 		log.Fatal("Error creating users table:", err)
 	}
 }
 
-// Validate email format
-func isValidEmail(email string) bool {
-	regex := regexp.MustCompile(`^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$`)
-	return regex.MatchString(email)
-}
-
-// Validate phone number format
-func isValidPhone(phone string) bool {
-	regex := regexp.MustCompile(`^[0-9]{10,15}$`)
-	return regex.MatchString(phone)
-}
-
-// Register a new user
+// User registration handler
 func registerUser(c *gin.Context) {
-	var request struct {
+	var req struct {
 		Name     string `json:"name"`
-		Phone    string `json:"phone"`
 		Email    string `json:"email"`
 		Password string `json:"password"`
 	}
-
-	// Bind JSON request body to struct
-	if err := c.ShouldBindJSON(&request); err != nil {
+	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": "Invalid request data"})
 		return
 	}
 
-	// Validate email and phone
-	if !isValidEmail(request.Email) {
-		c.JSON(400, gin.H{"error": "Invalid email format"})
-		return
-	}
-	if !isValidPhone(request.Phone) {
-		c.JSON(400, gin.H{"error": "Invalid phone number"})
-		return
-	}
+	hashedPassword, _ := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	userID := uuid.New().String()
 
-	// Hash the password
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(request.Password), bcrypt.DefaultCost)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "Error hashing password"})
-		return
-	}
-
-	// Generate unique ID for the new user
-	id := uuid.New().String()
-
-	// Insert new user into the database
-	_, err = db.Exec(
-		"INSERT INTO users (id, name, phone, email, password) VALUES (?, ?, ?, ?, ?)",
-		id, request.Name, request.Phone, request.Email, hashedPassword,
+	_, err := db.Exec(
+		"INSERT INTO users (id, name, email, password, isApproved) VALUES (?, ?, ?, ?, ?)",
+		userID, req.Name, req.Email, hashedPassword, false, // isApproved = false
 	)
 	if err != nil {
-		c.JSON(500, gin.H{"error": "Error registering user"})
-		log.Println(err)
+		c.JSON(500, gin.H{"error": "Error creating user"})
 		return
 	}
 
-	c.JSON(200, gin.H{"message": "User registered successfully"})
+	c.JSON(200, gin.H{"message": "User registered successfully. Awaiting admin approval."})
 }
 
-// Handle user login
+// User login handler
 func loginHandler(c *gin.Context) {
-	var request struct {
+	var req struct {
 		Email    string `json:"email"`
 		Password string `json:"password"`
 	}
-
-	// Bind JSON request body to struct
-	if err := c.ShouldBindJSON(&request); err != nil {
+	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": "Invalid request data"})
 		return
 	}
 
-	// Query the user by email
 	var user struct {
-		Name     string
-		Phone    string
-		Password string
-	}
-	query := "SELECT name, phone, password FROM users WHERE email = ?"
-	err := db.QueryRow(query, request.Email).Scan(&user.Name, &user.Phone, &user.Password)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			c.JSON(401, gin.H{"error": "Invalid email or password"})
-		} else {
-			c.JSON(500, gin.H{"error": "Database error"})
-		}
-		return
+		ID         string
+		Password   string
+		Role       string
+		IsApproved bool
 	}
 
-	// Compare password with the stored hash
-	err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(request.Password))
+	// Fetch user details from the database
+	err := db.QueryRow("SELECT id, password, role, isApproved FROM users WHERE email = ?", req.Email).
+		Scan(&user.ID, &user.Password, &user.Role, &user.IsApproved)
 	if err != nil {
 		c.JSON(401, gin.H{"error": "Invalid email or password"})
 		return
 	}
 
-	// Successful login
+	// Verify password
+	err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password))
+	if err != nil {
+		c.JSON(401, gin.H{"error": "Invalid email or password"})
+		return
+	}
+
+	// Include isApproved in the token payload
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"userId":     user.ID,
+		"role":       user.Role,
+		"isApproved": user.IsApproved, // Add this field
+		"exp":        time.Now().Add(24 * time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString(jwtSecret)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Error generating token"})
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "Login successful", "token": tokenString})
+}
+
+// List unapproved users
+func listUnapprovedUsers(c *gin.Context) {
+	rows, err := db.Query("SELECT id, name, email FROM users WHERE isApproved = ?", false)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Error fetching unapproved users"})
+		return
+	}
+	defer rows.Close()
+
+	var users []map[string]interface{}
+	for rows.Next() {
+		var id, name, email string
+		if err := rows.Scan(&id, &name, &email); err != nil {
+			c.JSON(500, gin.H{"error": "Error scanning user data"})
+			return
+		}
+		users = append(users, map[string]interface{}{
+			"id":    id,
+			"name":  name,
+			"email": email,
+		})
+	}
+	c.JSON(200, gin.H{"users": users})
+}
+
+// Approve user
+func approveUser(c *gin.Context) {
+	var req struct {
+		UserID string `json:"userId"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid request data"})
+		return
+	}
+	_, err := db.Exec("UPDATE users SET isApproved = TRUE WHERE id = ?", req.UserID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Error approving user"})
+		return
+	}
+	c.JSON(200, gin.H{"message": "User approved successfully"})
+}
+
+func validateTokenHandler(c *gin.Context) {
+	tokenString := c.GetHeader("Authorization")
+	if tokenString == "" {
+		c.JSON(401, gin.H{"error": "Authorization token required"})
+		return
+	}
+
+	token, err := jwt.Parse(tokenString[7:], func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method")
+		}
+		return jwtSecret, nil
+	})
+
+	if err != nil || !token.Valid {
+		c.JSON(401, gin.H{"error": "Invalid token"})
+		return
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		c.JSON(401, gin.H{"error": "Invalid token claims"})
+		return
+	}
+
+	// Ensure isApproved is returned
 	c.JSON(200, gin.H{
-		"message": "Login successful",
-		"name":    user.Name,
-		"phone":   user.Phone,
+		"userId":     claims["userId"],
+		"role":       claims["role"],
+		"isApproved": claims["isApproved"],
 	})
 }
 
-func main() {
-	// Load environment variables
-	loadEnvVars()
 
-	// Initialize database connection and create the database & table
+func main() {
+	loadEnvVars()
 	initDB()
 
-	// Create a new Gin router
 	r := gin.Default()
+	r.Use(corsMiddleware())
 
-	// Define API endpoints
-	r.POST("/api/register", registerUser) // Register user endpoint
-	r.POST("/api/login", loginHandler)   // Login endpoint
+	r.POST("/api/register", registerUser)
+	r.POST("/api/login", loginHandler)
+	r.GET("/api/admin/users", authMiddleware(), listUnapprovedUsers)
+	r.POST("/api/admin/approve-user", authMiddleware(), approveUser)
+	r.GET("/api/validate-token", validateTokenHandler)
 
-	// Start the server
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "3000"
 	}
 	r.Run(":" + port)
 }
-
