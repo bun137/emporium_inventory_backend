@@ -34,44 +34,112 @@ func loadEnvVars() {
 
 // Middleware to enable CORS
 func corsMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(204)
-			return
-		}
-		c.Next()
-	}
+    return func(c *gin.Context) {
+        // Set allowed origin to the specific frontend URL
+        origin := c.Request.Header.Get("Origin")
+        if origin == "http://localhost:5173" {
+            c.Header("Access-Control-Allow-Origin", origin)
+        }
+        
+        c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
+        c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type, Cache-Control")
+        c.Header("Access-Control-Allow-Credentials", "true")
+        
+        // Handle preflight requests
+        if c.Request.Method == "OPTIONS" {
+            c.Header("Access-Control-Max-Age", "86400") // 24 hours
+            c.Status(204)
+            c.Abort()
+            return
+        }
+        
+        c.Next()
+    }
 }
 
-// Middleware to verify JWT
-func authMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		tokenString := c.GetHeader("Authorization")
-		if tokenString == "" {
-			c.JSON(401, gin.H{"error": "Authorization token required"})
-			c.Abort()
-			return
-		}
+func authMiddleware(requiredRole string) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        tokenString := c.GetHeader("Authorization")
+        log.Printf("Received Authorization header: %s", tokenString) // Debug log
 
-		token, err := jwt.Parse(tokenString[7:], func(token *jwt.Token) (interface{}, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method")
-			}
-			return jwtSecret, nil
-		})
-		if err != nil || !token.Valid {
-			c.JSON(401, gin.H{"error": "Invalid token"})
-			c.Abort()
-			return
-		}
+        if tokenString == "" {
+            log.Printf("No Authorization header found") // Debug log
+            c.JSON(401, gin.H{"error": "Authorization token required"})
+            c.Abort()
+            return
+        }
 
-		claims := token.Claims.(jwt.MapClaims)
-		c.Set("userId", claims["userId"].(string))
-		c.Next()
-	}
+        // Check if the token starts with "Bearer "
+        if len(tokenString) < 7 || tokenString[:7] != "Bearer " {
+            log.Printf("Token doesn't start with 'Bearer '") // Debug log
+            c.JSON(401, gin.H{"error": "Invalid token format"})
+            c.Abort()
+            return
+        }
+
+        // Parse the JWT
+        token, err := jwt.Parse(tokenString[7:], func(token *jwt.Token) (interface{}, error) {
+            if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+                log.Printf("Unexpected signing method: %v", token.Header["alg"]) // Debug log
+                return nil, fmt.Errorf("unexpected signing method")
+            }
+            return jwtSecret, nil
+        })
+
+        if err != nil {
+            log.Printf("Error parsing token: %v", err) // Debug log
+            c.JSON(401, gin.H{"error": "Invalid token"})
+            c.Abort()
+            return
+        }
+
+        if !token.Valid {
+            log.Printf("Token is invalid") // Debug log
+            c.JSON(401, gin.H{"error": "Invalid token"})
+            c.Abort()
+            return
+        }
+
+        // Extract claims
+        claims, ok := token.Claims.(jwt.MapClaims)
+        if !ok {
+            log.Printf("Could not extract claims from token") // Debug log
+            c.JSON(401, gin.H{"error": "Invalid token claims"})
+            c.Abort()
+            return
+        }
+
+        log.Printf("Token claims: %+v", claims) // Debug log
+
+        userID, userOk := claims["userId"].(string)
+        if !userOk || userID == "" {
+            log.Printf("Invalid or missing userId in claims") // Debug log
+            c.JSON(403, gin.H{"error": "Invalid or missing userId in token"})
+            c.Abort()
+            return
+        }
+
+        // Check role if requiredRole is specified
+        if requiredRole != "" {
+            var exists bool
+            err = db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE id = ? AND role = ?)", userID, requiredRole).Scan(&exists)
+            if err != nil {
+                log.Printf("Error checking user role: %v", err) // Debug log
+                c.JSON(500, gin.H{"error": "Error checking user role"})
+                c.Abort()
+                return
+            }
+            if !exists {
+                log.Printf("User %s does not have required role %s", userID, requiredRole) // Debug log
+                c.JSON(403, gin.H{"error": "Access denied"})
+                c.Abort()
+                return
+            }
+        }
+
+        c.Set("userId", userID)
+        c.Next()
+    }
 }
 
 // Initialize the database
@@ -104,6 +172,7 @@ func initDB() {
 	}
 
 	createTables()
+	createSareesTable()
 }
 
 // Create necessary tables
@@ -117,12 +186,35 @@ func createTables() {
 		role VARCHAR(50) DEFAULT 'user',
 		isApproved BOOLEAN DEFAULT FALSE
 	);`
+
 	_, err := db.Exec(usersTable)
 	if err != nil {
 		log.Fatal("Error creating users table:", err)
 	}
+		// Create an index on the 'id' column for fast lookups
+	_, err = db.Exec("CREATE INDEX IF NOT EXISTS idx_user_id ON users (id);")
+	if err != nil {
+		log.Fatal("Error creating index on users table:", err)
+	}
+
 }
 
+func createSareesTable() {
+    sareesTable := `
+    CREATE TABLE IF NOT EXISTS sarees (
+        id VARCHAR(36) PRIMARY KEY,
+        material VARCHAR(255),
+        price DECIMAL(10, 2),
+        in_date DATE,
+        weaver VARCHAR(255) NULL,
+        dye_type VARCHAR(255),
+        ikat_type VARCHAR(255)
+    );`
+    _, err := db.Exec(sareesTable)
+    if err != nil {
+        log.Fatal("Error creating sarees table:", err)
+    }
+}
 // User registration handler
 func registerUser(c *gin.Context) {
 	var req struct {
@@ -152,51 +244,67 @@ func registerUser(c *gin.Context) {
 
 // User login handler
 func loginHandler(c *gin.Context) {
-	var req struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": "Invalid request data"})
-		return
-	}
+    var req struct {
+        Email    string `json:"email"`
+        Password string `json:"password"`
+    }
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(400, gin.H{"error": "Invalid request data"})
+        return
+    }
 
-	var user struct {
-		ID         string
-		Password   string
-		Role       string
-		IsApproved bool
-	}
+    var user struct {
+        ID         string
+        Password   string
+        Role       string
+        IsApproved bool
+    }
 
-	// Fetch user details from the database
-	err := db.QueryRow("SELECT id, password, role, isApproved FROM users WHERE email = ?", req.Email).
-		Scan(&user.ID, &user.Password, &user.Role, &user.IsApproved)
-	if err != nil {
-		c.JSON(401, gin.H{"error": "Invalid email or password"})
-		return
-	}
+    // Fetch user details from the database
+    err := db.QueryRow(
+        "SELECT id, password, role, isApproved FROM users WHERE email = ?",
+        req.Email,
+    ).Scan(&user.ID, &user.Password, &user.Role, &user.IsApproved)
+    
+    if err != nil {
+        log.Printf("Login failed for email %s: %v", req.Email, err)
+        c.JSON(401, gin.H{"error": "Invalid email or password"})
+        return
+    }
 
-	// Verify password
-	err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password))
-	if err != nil {
-		c.JSON(401, gin.H{"error": "Invalid email or password"})
-		return
-	}
+    // Verify password
+    err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password))
+    if err != nil {
+        log.Printf("Password verification failed for user %s", user.ID)
+        c.JSON(401, gin.H{"error": "Invalid email or password"})
+        return
+    }
 
-	// Include isApproved in the token payload
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"userId":     user.ID,
-		"role":       user.Role,
-		"isApproved": user.IsApproved, // Add this field
-		"exp":        time.Now().Add(24 * time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString(jwtSecret)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "Error generating token"})
-		return
-	}
+    // Create the token
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+        "userId": user.ID,
+        "role":   user.Role,
+        "exp":    time.Now().Add(24 * time.Hour).Unix(),
+    })
 
-	c.JSON(200, gin.H{"message": "Login successful", "token": tokenString})
+    tokenString, err := token.SignedString(jwtSecret)
+    if err != nil {
+        log.Printf("Error generating token: %v", err)
+        c.JSON(500, gin.H{"error": "Error generating token"})
+        return
+    }
+
+    log.Printf("Successful login for user %s with role %s", user.ID, user.Role)
+
+    c.JSON(200, gin.H{
+        "message": "Login successful",
+        "token":   tokenString,
+        "user": gin.H{
+            "id":         user.ID,
+            "role":      user.Role,
+            "isApproved": user.IsApproved,
+        },
+    })
 }
 
 // List unapproved users
@@ -242,38 +350,117 @@ func approveUser(c *gin.Context) {
 }
 
 func validateTokenHandler(c *gin.Context) {
-	tokenString := c.GetHeader("Authorization")
-	if tokenString == "" {
-		c.JSON(401, gin.H{"error": "Authorization token required"})
-		return
-	}
+    tokenString := c.GetHeader("Authorization")
+    if tokenString == "" {
+        c.JSON(401, gin.H{"error": "Authorization token required"})
+        return
+    }
 
-	token, err := jwt.Parse(tokenString[7:], func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method")
-		}
-		return jwtSecret, nil
-	})
+    token, err := jwt.Parse(tokenString[7:], func(token *jwt.Token) (interface{}, error) {
+        if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+            return nil, fmt.Errorf("unexpected signing method")
+        }
+        return jwtSecret, nil
+    })
 
-	if err != nil || !token.Valid {
-		c.JSON(401, gin.H{"error": "Invalid token"})
-		return
-	}
+    if err != nil || !token.Valid {
+        c.JSON(401, gin.H{"error": "Invalid token"})
+        return
+    }
 
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		c.JSON(401, gin.H{"error": "Invalid token claims"})
-		return
-	}
+    claims, ok := token.Claims.(jwt.MapClaims)
+    if !ok {
+        c.JSON(401, gin.H{"error": "Invalid token claims"})
+        return
+    }
 
-	// Ensure isApproved is returned
-	c.JSON(200, gin.H{
-		"userId":     claims["userId"],
-		"role":       claims["role"],
-		"isApproved": claims["isApproved"],
-	})
+    userID := claims["userId"].(string)
+    var isApproved sql.NullBool
+    var role string
+
+    // Fetch approval status and role
+    err = db.QueryRow("SELECT isApproved, role FROM users WHERE id = ?", userID).Scan(&isApproved, &role)
+    if err != nil {
+        log.Printf("Error fetching user data: %v", err)
+        c.JSON(500, gin.H{"error": "Error fetching user data"})
+        return
+    }
+
+    // Convert sql.NullBool to a standard boolean
+    approvalStatus := false
+    if isApproved.Valid {
+        approvalStatus = isApproved.Bool
+    }
+
+    c.JSON(200, gin.H{
+        "userId":     userID,
+        "role":       role,
+        "isApproved": approvalStatus,
+    })
 }
 
+func createSaree(c *gin.Context) {
+    var request struct {
+        Material string  `json:"material"`
+        Price    float64 `json:"price"`
+        InDate   string  `json:"inDate"`
+        Weaver   *string `json:"weaver"` // Nullable
+        DyeType  string  `json:"dyeType"`
+        IkatType string  `json:"ikatType"`
+    }
+
+    if err := c.ShouldBindJSON(&request); err != nil {
+        c.JSON(400, gin.H{"error": "Invalid request data"})
+        return
+    }
+
+    // Generate a new UUID for the saree
+    sareeID := uuid.New().String()
+
+    // Insert the saree into the database
+    _, err := db.Exec(
+        "INSERT INTO sarees (id, material, price, in_date, weaver, dye_type, ikat_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        sareeID, request.Material, request.Price, request.InDate, request.Weaver, request.DyeType, request.IkatType,
+    )
+    if err != nil {
+        c.JSON(500, gin.H{"error": "Error creating saree"})
+        return
+    }
+
+    c.JSON(200, gin.H{"message": "Saree created successfully", "id": sareeID})
+}
+
+// FetchSarees handler
+func fetchSarees(c *gin.Context) {
+    rows, err := db.Query("SELECT id, material, price, in_date, weaver, dye_type, ikat_type FROM sarees")
+    if err != nil {
+        c.JSON(500, gin.H{"error": "Error fetching sarees"})
+        return
+    }
+    defer rows.Close()
+
+    var sarees []map[string]interface{}
+    for rows.Next() {
+        var id, material, inDate, dyeType, ikatType string
+        var price float64
+        var weaver *string
+        if err := rows.Scan(&id, &material, &price, &inDate, &weaver, &dyeType, &ikatType); err != nil {
+            c.JSON(500, gin.H{"error": "Error scanning saree data"})
+            return
+        }
+        sarees = append(sarees, map[string]interface{}{
+            "id":       id,
+            "material": material,
+            "price":    price,
+            "inDate":   inDate,
+            "weaver":   weaver,
+            "dyeType":  dyeType,
+            "ikatType": ikatType,
+        })
+    }
+
+    c.JSON(200, gin.H{"sarees": sarees})
+}
 
 func main() {
 	loadEnvVars()
@@ -284,9 +471,12 @@ func main() {
 
 	r.POST("/api/register", registerUser)
 	r.POST("/api/login", loginHandler)
-	r.GET("/api/admin/users", authMiddleware(), listUnapprovedUsers)
-	r.POST("/api/admin/approve-user", authMiddleware(), approveUser)
-	r.GET("/api/validate-token", validateTokenHandler)
+	r.GET("/api/admin/users", authMiddleware("admin"), listUnapprovedUsers)
+	r.POST("/api/admin/approve-user", authMiddleware("admin"), approveUser)
+	r.GET("/api/sarees", authMiddleware(""), fetchSarees) // No role restriction
+	r.POST("/api/sarees", authMiddleware(""), createSaree) // No role restriction
+	r.GET("/api/validate-token", authMiddleware(""), validateTokenHandler)
+
 
 	port := os.Getenv("PORT")
 	if port == "" {
