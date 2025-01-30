@@ -332,6 +332,29 @@ func listUnapprovedUsers(c *gin.Context) {
 	c.JSON(200, gin.H{"users": users})
 }
 
+func listApprovedUsers(c *gin.Context){
+    rows, err := db.Query("SELECT id, name, email FROM users WHERE isApproved = ?", true)
+    if err != nil {
+        c.JSON(500, gin.H{"error": "Error fetching approved users"})
+        return
+    }
+    defer rows.Close()
+
+    var users []map[string]interface{}
+    for rows.Next() {
+        var id, name, email string
+        if err := rows.Scan(&id, &name, &email); err != nil{
+            c.JSON(500, gin.H{"error": "Error scanning user data"})
+            return
+        }
+        users = append(users, map[string]interface{}{
+            "id": id,
+            "name": name,
+            "email": email,
+        })
+    }
+    c.JSON(200, gin.H{"users": users})
+}
 // Approve user
 func approveUser(c *gin.Context) {
 	var req struct {
@@ -462,6 +485,48 @@ func fetchSarees(c *gin.Context) {
     c.JSON(200, gin.H{"sarees": sarees})
 }
 
+// Revoke user access handler
+func revokeUser(c *gin.Context) {
+	var req struct {
+		UserID string `json:"userId"`
+	}
+
+	// Bind JSON input to the request struct
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid request data"})
+		return
+	}
+
+	// Check if the user exists and is currently approved
+	var isApproved bool
+	err := db.QueryRow("SELECT isApproved FROM users WHERE id = ?", req.UserID).Scan(&isApproved)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(404, gin.H{"error": "User not found"})
+		} else {
+			log.Printf("Error fetching user data: %v", err)
+			c.JSON(500, gin.H{"error": "Error fetching user data"})
+		}
+		return
+	}
+
+	if !isApproved {
+		c.JSON(400, gin.H{"error": "User is already unapproved"})
+		return
+	}
+
+	// Revoke the user's approval
+	_, err = db.Exec("UPDATE users SET isApproved = FALSE WHERE id = ?", req.UserID)
+	if err != nil {
+		log.Printf("Error revoking user access: %v", err)
+		c.JSON(500, gin.H{"error": "Error revoking user access"})
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "User access revoked successfully"})
+}
+
+
 func main() {
 	loadEnvVars()
 	initDB()
@@ -469,15 +534,32 @@ func main() {
 	r := gin.Default()
 	r.Use(corsMiddleware())
 
+	// Public Routes
 	r.POST("/api/register", registerUser)
 	r.POST("/api/login", loginHandler)
-	r.GET("/api/admin/users", authMiddleware("admin"), listUnapprovedUsers)
-	r.POST("/api/admin/approve-user", authMiddleware("admin"), approveUser)
-	r.GET("/api/sarees", authMiddleware(""), fetchSarees) // No role restriction
-	r.POST("/api/sarees", authMiddleware(""), createSaree) // No role restriction
+
+	// Admin Protected Routes
+	adminGroup := r.Group("/api/admin")
+	adminGroup.Use(authMiddleware("admin"))
+	{
+		adminGroup.GET("/users", listUnapprovedUsers)
+		adminGroup.POST("/approve-user", approveUser)
+		adminGroup.POST("/revoke-user", revokeUser) // New Route for Revoking Users
+		adminGroup.GET("/approvedUsers", listApprovedUsers)
+	}
+
+	// Sarees Routes
+	sareesGroup := r.Group("/api/sarees")
+	sareesGroup.Use(authMiddleware(""))
+	{
+		sareesGroup.GET("", fetchSarees)
+		sareesGroup.POST("", createSaree)
+	}
+
+	// Token Validation
 	r.GET("/api/validate-token", authMiddleware(""), validateTokenHandler)
 
-
+	// Start the server
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "3000"
