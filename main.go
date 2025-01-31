@@ -145,22 +145,16 @@ func authMiddleware(requiredRole string) gin.HandlerFunc {
 // Initialize the database
 func initDB() {
 	var err error
-	dbHost := os.Getenv("DB_HOST")
-	dbUser := os.Getenv("DB_USER")
-	dbPassword := os.Getenv("DB_PASSWORD")
-	dbName := os.Getenv("DB_NAME")
+	dbHost := "mysql"
+	dbUser := "shreya"
+	dbPassword := os.Getenv("MYSQL_PASSWORD")
+	dbName := "emporium_database"
 
 	connStr := fmt.Sprintf("%s:%s@tcp(%s)/", dbUser, dbPassword, dbHost)
 	db, err = sql.Open("mysql", connStr)
 	if err != nil {
 		log.Fatal("Error connecting to MySQL:", err)
 	}
-
-	_, err = db.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", dbName))
-	if err != nil {
-		log.Fatal("Error creating database:", err)
-	}
-
 	connStr = fmt.Sprintf("%s:%s@tcp(%s)/%s", dbUser, dbPassword, dbHost, dbName)
 	db, err = sql.Open("mysql", connStr)
 	if err != nil {
@@ -190,11 +184,6 @@ func createTables() {
 	_, err := db.Exec(usersTable)
 	if err != nil {
 		log.Fatal("Error creating users table:", err)
-	}
-		// Create an index on the 'id' column for fast lookups
-	_, err = db.Exec("CREATE INDEX IF NOT EXISTS idx_user_id ON users (id);")
-	if err != nil {
-		log.Fatal("Error creating index on users table:", err)
 	}
 
 }
@@ -544,7 +533,7 @@ func main() {
 	{
 		adminGroup.GET("/users", listUnapprovedUsers)
 		adminGroup.POST("/approve-user", approveUser)
-		adminGroup.POST("/revoke-user", revokeUser) // New Route for Revoking Users
+		adminGroup.POST("/revoke-user", revokeUser) 
 		adminGroup.GET("/approvedUsers", listApprovedUsers)
 	}
 
@@ -559,10 +548,9 @@ func main() {
 	// Token Validation
 	r.GET("/api/validate-token", authMiddleware(""), validateTokenHandler)
 
-	// Start the server
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "3000"
+		port = "7575"
 	}
 	r.Run(":" + port)
 }

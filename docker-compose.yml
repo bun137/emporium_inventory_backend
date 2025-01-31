@@ -1,0 +1,41 @@
+name: emporium_backend
+
+services:
+  mysql:
+    image: mysql:latest
+    env_file: .env
+    restart: unless-stopped
+    environment:
+      MYSQL_USER: "shreya"
+      MYSQL_DATABASE: "emporium_database"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - emporium_network
+
+
+  backend:
+    working_dir: /emporium/backend
+    env_file: .env
+    restart: unless-stopped
+    build:
+      dockerfile: Dockerfile
+    networks:
+      - emporium_network
+    depends_on:
+      - mysql
+    ports:
+      - 7575:7575
+    develop:
+      watch:
+        - action: sync+restart
+          path: .
+          target: /emporium/backend
+
+
+volumes:
+  mysql_data:
+
+networks:
+  emporium_network:
+    driver: bridge
